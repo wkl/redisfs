@@ -27,6 +27,8 @@ is_linux = require('os').platform == 'linux'  # otherwise we assume it is bsd/da
 
 class ENOENT extends Error
     constructor: (@message="No such file or directory", @errno=2) ->
+class EBADF extends Error
+    constructor: (@message="Bad file descriptor", @errno=9) ->
 class EEXIST extends Error
     constructor: (@message="File exists", @errno=17) ->
 class ENOTDIR extends Error
@@ -41,19 +43,23 @@ class ENOTEMPTY extends Error
 # @type is set to unknown if we didn't retrieve it from redis
 class Obj
     constructor: (@id, @type=TYPE.UNKNOWN) ->
-        @size = 0
+        @size = -1
+        @id = parseInt(@id) # cb(0, @id) in open() requires it is int
     is_reg: ->
         return @type == TYPE.REGULAR
     is_dir: ->
         return @type == TYPE.DIRECTORY
+    sync_p: ->
+        assert(@content?)
+        assert(@size >= 0)
+        console.log(@size, @content)
+        return client.hmsetAsync(@id, 'size', @size, 'content', @content).tap(() =>
+            console.log("#{@size} bytes flushed to redis")
+        )
+    sanitize: ->
+        @size = parseInt(@size)
 
 root = new Obj(ROOT_ID, TYPE.DIRECTORY)
-
-# File's all fields in a Redis hash
-# object_fields = ['type', 'mode', size]
-# delete specific fields for a given id
-# https://github.com/NodeRedis/node_redis/issues/369
-# return client.send_commandAsync('hdel', [id].concat(object_fields))
 
 clear_by_id_p = (id) ->
     return client.delAsync(id)
@@ -115,19 +121,23 @@ lookup_parent_p = (path) ->
         return parent.id
     )
 
+object_fields = ['type', 'mode', 'size']
+# delete specific fields for a given id
+# https://github.com/NodeRedis/node_redis/issues/369
+# return client.send_commandAsync('hdel', [id].concat(object_fields))
+
 # Retrieve fields from redis
 get_obj_attr_p = (id, fields...) ->
-    obj = new Obj(id)
     if fields.length == 0
-        return client.hgetallAsync(id).then((redis_obj) ->
-            obj[k] = v for k, v of redis_obj
-            return obj
-        )
+        # Get all fields except content
+        fields = object_fields
 
-    # assert(fields instanceof Array)
+    assert(fields instanceof Array)
     client.hmgetAsync(id, fields...).then((l) ->
         assert(l.length == fields.length)
+        obj = new Obj(id)
         obj[k] = l[i] for k, i in fields
+        obj.sanitize()
         return obj
     )
 
@@ -172,7 +182,7 @@ getattr = (path, cb) ->
         console.log("getattr(#{path}):", obj)
         if obj['type'] == TYPE.REGULAR
             stat.size = obj.size
-            stat.mode = 0o100666    # TODO translate from obj.mode
+            stat.mode = 0o100777    # TODO translate from obj.mode
         else
             stat.size = 4096
             stat.mode = 0o40777
@@ -201,25 +211,76 @@ readdir = (path, cb) ->
 
 open = (path, flags, cb) ->
     console.log("open", arguments)
-    err = 0
-    # TODO check flags
     lookup_p(path).then((id) ->
         return get_obj_attr_p(id)
     ).then((obj) ->
+        # TODO check flags
         console.log(obj)
+        if not obj.is_reg()
+            return Promise.reject(new EBADF())
+        # return fh so that we save a lookup for subsequent read/write
+        cb(0, obj.id)
     ).catch((e) ->
         err = e.errno ? INTERNAL_ERR
-        console.log("Error during readdir: ", e)
-    ).finally(() ->
+        console.log("Error during open: ", e)
         cb(-err)
+    )
+
+get_content_p = (id) ->
+    return get_obj_attr_p(id, 'content').then((obj) ->
+        return obj.content
     )
 
 read = (path, offset, len, buf, fh, cb) ->
     console.log("read", arguments)
-    cb(-(new ENOTSUP()).errno)
+    get_obj_attr_p(fh).then((obj) ->    # assume exist
+        if not obj.is_reg()
+            return Promise.reject(new EBADF())
+        return get_content_p(fh)
+    ).then((content) ->
+        buf.write(content, offset, len, 'utf8')
+        cb(buf.length)
+    ).catch((e) ->
+        err = e.errno ? INTERNAL_ERR
+        console.log("Error during write: ", e)
+        cb(-err)
+    )
+
+# read-modify-update
 write = (path, offset, len, buf, fh, cb) ->
-    console.log("read", arguments)
-    cb(-(new ENOTSUP()).errno)
+    console.log("write", arguments)
+    get_obj_attr_p(fh).then((obj) ->    # assume exist
+        console.log(obj)
+        if not obj.is_reg()
+            return Promise.reject(new EBADF())
+        obj.content = ''
+        if not (offset == 0 and len >= obj.size)    # overwrite all, save a read
+            return get_content_p(id).then((content) ->
+                obj.content = content
+            )
+        return obj
+    ).then((obj) ->
+        assert(obj.size != -1)
+        buf_str = buf.toString('utf8')
+        if offset == obj.size
+            obj.content += buf_str
+        else if offset < obj.size
+            obj.content = obj.content[..offset-1] + buf_str +
+                obj.content[offset+len..]
+        else if offset > obj.size
+            obj.content += Array(offset - obj.size).join('\0') + buf_str
+        obj.size = Math.max(obj.size, offset + len)
+        return obj
+    ).then((obj) ->
+        return obj.sync_p()
+    ).then(() ->
+        cb(len) # assume full write
+    ).catch((e) ->
+        err = e.errno ? INTERNAL_ERR
+        console.log("Error during write: ", e)
+        cb(-err)
+    )
+
 release = (path, fh, cb) ->
     console.log("release", arguments)
     cb(0)
@@ -284,6 +345,7 @@ setxattr = (path, name, value, size, a, b, c) ->
     cb(0);
 statfs = (cb) ->
     # console.log("statfs", arguments)
+    # TODO limit file size
     cb(0, {
         bsize: 1000000,
         frsize: 1000000,
@@ -372,4 +434,5 @@ handlers =
     destroy: destroy
     setxattr: setxattr
     statfs: statfs
+    # TODO truncate
 
