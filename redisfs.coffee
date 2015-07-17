@@ -2,16 +2,18 @@ f4js = require('fuse4js')
 Promise = require('bluebird')
 redis = Promise.promisifyAll(require('redis'))
 # Promise.longStackTraces();
-
-class ENOENTError extends Error
-    constructor: (@message="No such file or directory", @errno=2) ->
+assert = require('assert')
+pp = require('path')    # path parser
 
 # Id stands for object id (or inode number)
 ROOT_ID = 1
-CURR_ID_PREFIX = 'current_id'
+CURR_ID_KEY = 'current_id'
+ENTRIES_KEY = (id) -> "#{id}_entries"
+INTERNAL_ERR = 99
 
 # File type enums
 TYPE =
+    UNKNOWN: '-1'
     REGULAR: '0'
     DIRECTORY: '1'
     to_str: (type) ->
@@ -21,9 +23,24 @@ TYPE =
             else 'Unknown type'
 Object.freeze(TYPE)
 
-###
+is_linux = require('os').platform == 'linux'  # otherwise we assume it is bsd/darwin
+
+class ENOENT extends Error
+    constructor: (@message="No such file or directory", @errno=2) ->
+class EEXIST extends Error
+    constructor: (@message="File exists", @errno=17) ->
+class ENOTDIR extends Error
+    constructor: (@message="Not a directory", @errno=20) ->
+class ENOTSUP extends Error
+    constructor: (@message="Function not implemented", @errno=45) ->
+        @errno = 252 if is_linux
+class ENOTEMPTY extends Error
+    constructor: (@message="Directory not empty", @errno=66) ->
+        @errno = 39 if is_linux
+
+# @type is set to unknown if we didn't retrieve it from redis
 class Obj
-    constructor: (@id, @type=TYPE.REGULAR) ->
+    constructor: (@id, @type=TYPE.UNKNOWN) ->
         @size = 0
     is_reg: ->
         return @type == TYPE.REGULAR
@@ -31,15 +48,12 @@ class Obj
         return @type == TYPE.DIRECTORY
 
 root = new Obj(ROOT_ID, TYPE.DIRECTORY)
-###
 
-###
 # File's all fields in a Redis hash
-object_fields = ['type', 'mode', size]
+# object_fields = ['type', 'mode', size]
 # delete specific fields for a given id
 # https://github.com/NodeRedis/node_redis/issues/369
 # return client.send_commandAsync('hdel', [id].concat(object_fields))
-###
 
 clear_by_id_p = (id) ->
     return client.delAsync(id)
@@ -60,30 +74,20 @@ create_by_id_p = (id, type=TYPE.REGULAR, mode=0o777) ->
 # Get next available id for new file
 # TODO consider race condition
 get_next_id_p = () ->
-    return client.incrAsync(CURR_ID_PREFIX)
+    return client.incrAsync(CURR_ID_KEY)
 
+# Callers make sure pid is valid directory
 create_at_p = (pid, name, type=TYPE.REGULAR, mode=0o777) ->
-    # TODO check pid is existing and directory
-    # TODO check name non exist
-    # Front end (FUSE, VFS) may check as well
     # create an object and add the directory entry to the parent
-
-    created_id = 0
     return get_next_id_p().then((id) ->
-        created_id = id
         return create_by_id_p(id, type, mode)
     ).then((id) ->
-        client.hsetAsync("#{pid}_entries", name, id)
-    ).then(() ->
-            return Promise.resolve(created_id)
-    ).tap(() ->
-            console.log("Entry #{name} [#{created_id}] added to directory [#{pid}]")
+        return add_entry_p(pid, name, id)
     ).catch((e) ->
         # TODO rollback: delete the created object?
         console.log("Error during create_at(#{pid}, #{name}): ", e)
     )
 
-# TODO validate path?
 lookup_p = (path) ->
     chain = Promise.resolve(ROOT_ID)
     return chain if path == '/'
@@ -93,7 +97,7 @@ lookup_p = (path) ->
         chain = chain.then((pid) ->
             # console.log("Looking up '#{name}' in directory [#{pid}]")
             return client.hgetAsync("#{pid}_entries", name).then((id) ->
-                return Promise.reject(new ENOENTError()) if !id
+                return Promise.reject(new ENOENT()) if !id
                 console.log("Found '#{name}' [#{id}] in directory [#{pid}]")
                 return id
             )
@@ -101,24 +105,80 @@ lookup_p = (path) ->
     )
     return chain
 
-# fuse hander
+lookup_parent_p = (path) ->
+    parent_path = pp.dirname(path)
+    return lookup_p(parent_path).then((pid) ->
+        return get_obj_attr_p(pid, 'type')
+    ).then((parent) ->
+        if not parent.is_dir()
+            return Promise.reject(new ENOTDIR())
+        return parent.id
+    )
+
+# Retrieve fields from redis
+get_obj_attr_p = (id, fields...) ->
+    obj = new Obj(id)
+    if fields.length == 0
+        return client.hgetallAsync(id).then((redis_obj) ->
+            obj[k] = v for k, v of redis_obj
+            return obj
+        )
+
+    # assert(fields instanceof Array)
+    client.hmgetAsync(id, fields...).then((l) ->
+        assert(l.length == fields.length)
+        obj[k] = l[i] for k, i in fields
+        return obj
+    )
+
+# Retrieve directory entries
+# return name, id pairs
+get_dir_entries_p = (id) ->
+    return client.hgetallAsync(ENTRIES_KEY(id))
+
+# Do not override
+add_entry_p = (pid, name, id) ->
+    return client.hsetnxAsync(ENTRIES_KEY(pid), name, id).then((ret) ->
+        if ret == 0
+            return Promise.reject(new EEXIST())
+        console.log("Entry #{name} [#{id}] added to directory [#{pid}]")
+        return id
+    )
+
+del_entry_p = (pid, name) ->
+    entry_id = 0
+    return client.hgetAsync(ENTRIES_KEY(pid), name).then((id) ->
+        return id || Promise.reject(now ENOENT())
+    ).then((id) ->
+        entry_id = id
+        client.hlenAsync(ENTRIES_KEY(id))
+    ).then((len) ->
+        if len > 0
+            return Promise.reject(new ENOTEMPTY())
+        return client.hdelAsync(ENTRIES_KEY(pid), name)
+    ).then((ret) ->
+        assert(ret == 1)    # to detect race
+        return Promise.resolve(entry_id)
+    )
+
+# FUSE hander
 getattr = (path, cb) ->
-    console.log("getattr", arguments)
+    # console.log("getattr", arguments)
     err = 0
     stat = {}
     lookup_p(path).then((id) ->
-        return client.hgetallAsync(id)
+        return get_obj_attr_p(id)
     ).then((obj) ->
-        console.log(obj)
+        console.log("getattr(#{path}):", obj)
         if obj['type'] == TYPE.REGULAR
             stat.size = obj.size
-            stat.mode = 0o010777
+            stat.mode = 0o100666    # TODO translate from obj.mode
         else
             stat.size = 4096
-            stat.mode = 0o040777
+            stat.mode = 0o40777
     ).catch((e) ->
-        err = e.errno ? 99
-        console.log("Error during getattr: ", e)
+        err = e.errno ? INTERNAL_ERR
+        # console.log("Error during getattr: ", e)
     ).finally(() ->
         cb(-err, stat)
     )
@@ -128,40 +188,100 @@ readdir = (path, cb) ->
     err = 0
     names = []
     lookup_p(path).then((id) ->
-        return client.hgetallAsync("#{id}_entries")
-    ).then((obj) ->
-        for k, v of obj
-            names.push(k)
+        return get_dir_entries_p(id)
+    ).then((entries) ->
+        names.push(name) for name of entries
         console.log(names)
     ).catch((e) ->
+        err = e.errno ? INTERNAL_ERR
         console.log("Error during readdir: ", e)
     ).finally(() ->
-        cb(err, names)
+        cb(-err, names)
     )
 
 open = (path, flags, cb) ->
     console.log("open", arguments)
+    err = 0
+    # TODO check flags
+    lookup_p(path).then((id) ->
+        return get_obj_attr_p(id)
+    ).then((obj) ->
+        console.log(obj)
+    ).catch((e) ->
+        err = e.errno ? INTERNAL_ERR
+        console.log("Error during readdir: ", e)
+    ).finally(() ->
+        cb(-err)
+    )
+
 read = (path, offset, len, buf, fh, cb) ->
     console.log("read", arguments)
+    cb(-(new ENOTSUP()).errno)
 write = (path, offset, len, buf, fh, cb) ->
     console.log("read", arguments)
+    cb(-(new ENOTSUP()).errno)
 release = (path, fh, cb) ->
     console.log("release", arguments)
+    cb(0)
+
 create = (path, mode, cb) ->
     console.log("create", arguments)
+    err = 0
+    name = pp.basename(path)
+    lookup_parent_p(path).then((pid) ->
+        create_at_p(pid, name, TYPE.REGULAR)
+    ).catch((e) ->
+        err = e.errno ? INTERNAL_ERR
+        console.log(err)
+    ).finally(() ->
+        cb(-err)
+    )
+
 unlink = (path, cb) ->
     console.log("unlink", arguments)
+    err = 0
+    name = pp.basename(path)
+    lookup_parent_p(path).then((pid) ->
+        del_entry_p(pid, name)
+    ).then((id) ->
+        return clear_by_id_p(id)
+    ).then((ret) ->
+        assert(ret == 1)    # to detect race
+    ).catch((e) ->
+        err = e.errno ? INTERNAL_ERR
+        console.log(err)
+    ).finally(() ->
+        cb(-err)
+    )
+
 rename = (src, dst, cb) ->
     console.log("rename", arguments)
+    cb(-(new ENOTSUP()).errno)
+
+# TODO reuse create
 mkdir = (path, mode, cb) ->
     console.log("mkdir", arguments)
+    err = 0
+    name = pp.basename(path)
+    lookup_parent_p(path).then((pid) ->
+        create_at_p(pid, name, TYPE.DIRECTORY)
+    ).catch((e) ->
+        err = e.errno ? INTERNAL_ERR
+        console.log(err)
+    ).finally(() ->
+        cb(-err)
+    )
+
 rmdir = (path, cb) ->
     console.log("rmdir", arguments)
+    unlink(path, cb)
+
 init = (cb) ->
     console.log("init", arguments)
     cb()
 setxattr = (path, name, value, size, a, b, c) ->
     console.log("setxattr", arguments)
+    cb(0);
 statfs = (cb) ->
     # console.log("statfs", arguments)
     cb(0, {
@@ -179,6 +299,7 @@ statfs = (cb) ->
     })
 destroy = (cb) ->
     console.log("destory", arguments)
+    cb()
 
 # Setup Redis client
 client = redis.createClient(6379, '127.0.0.1')
@@ -198,7 +319,7 @@ init_p = () ->
         client.flushdbAsync()
     ).then(() ->
         # create current id if not exists
-        return client.setnxAsync(CURR_ID_PREFIX, 1)
+        return client.setnxAsync(CURR_ID_KEY, 1)
     ).catch((e) ->
         console.log('Error during initialization')
         process.exit(1)
@@ -221,6 +342,10 @@ main = ->
     ).then(() ->
         lookup_p("/dir1/deep").catch((e) ->
             console.log("Error during lookup: ", e)
+        )
+    ).then(() ->
+        get_obj_attr_p(2, 'mode').then((obj) ->
+            console.log('get_obj_attr', obj)
         )
     ).then(() ->
         try
